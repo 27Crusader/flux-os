@@ -1,7 +1,8 @@
-// Bare-Metal VGA Driver, PIT Timer, Mode 13h Graphics, RAM VFS, Flux Engine, Interactive Mouse & Editor
+// Bare-Metal VGA Register Driver, Double Buffer Engine, PIT Timer, Text GUI, Windowing Engine, RAM VFS & Flux Interpreter
 #define VGA_TEXT_ADDR 0xB8000
 #define VGA_GFX_ADDR  0xA0000
 #define BUF_SIZE 2000
+#define GFX_SIZE 64000
 #define MAX_CMD_LEN 256
 #define MAX_VARS 32
 #define MAX_FILES 16
@@ -16,14 +17,16 @@ volatile uint16_t* vga_text = (uint16_t*)VGA_TEXT_ADDR;
 volatile uint8_t* vga_gfx  = (uint8_t*)VGA_GFX_ADDR;
 int vga_index = 0;
 
-volatile uint32_t timer_ticks = 0;
-
+// Dynamic Allocation & Screen Double Buffer
 uint32_t heap_curr = 0x200000;
 void* kmalloc(uint32_t size) {
     void* ptr = (void*)heap_curr;
     heap_curr += size;
     return ptr;
 }
+
+uint8_t* back_buffer = (uint8_t*)0x100000; // 64KB allocated off-screen buffer
+bool in_gfx_mode = false;
 
 static inline uint8_t inb(uint16_t port) {
     uint8_t ret;
@@ -76,38 +79,57 @@ void itoa(int num, char* str) {
     }
 }
 
-uint16_t make_vgaentry(char c, uint8_t color) {
-    return (uint16_t) c | (uint16_t) color << 8;
+// --- HARDWARE VGA MODE SWITCHING REGISTERS ---
+uint8_t g_320x200x256[] = {
+/* MISC */ 0x63,
+/* SEQ */  0x03, 0x01, 0x0F, 0x00, 0x0E,
+/* CRTC */ 0x5F, 0x4F, 0x50, 0x82, 0x54, 0x80, 0xBF, 0x1F, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x9C, 0x0E, 0x8F, 0x28, 0x40, 0x96, 0xB9, 0xA3, 0xFF,
+/* GC */   0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x05, 0x0F, 0xFF,
+/* AC */   0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x41, 0x00, 0x0F, 0x00, 0x00
+};
+
+uint8_t g_80x25_text[] = {
+/* MISC */ 0x67,
+/* SEQ */  0x03, 0x00, 0x03, 0x00, 0x02,
+/* CRTC */ 0x5F, 0x4F, 0x50, 0x82, 0x55, 0x81, 0xBF, 0x1F, 0x00, 0x4F, 0x0D, 0x0E, 0x00, 0x00, 0x00, 0x50, 0x9C, 0x0E, 0x8F, 0x28, 0x1F, 0x96, 0xB9, 0xA3, 0xFF,
+/* GC */   0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x0E, 0x00, 0xFF,
+/* AC */   0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x0C, 0x00, 0x0F, 0x00, 0x00
+};
+
+void write_vga_regs(uint8_t* regs) {
+    outb(0x3C2, *regs++);
+    for (uint8_t i = 0; i < 5; i++) { outb(0x3C4, i); outb(0x3C5, *regs++); }
+    outb(0x3D4, 0x03); outb(0x3D5, inb(0x3D5) | 0x80);
+    outb(0x3D4, 0x11); outb(0x3D5, inb(0x3D5) & ~0x80);
+    regs[0x03] |= 0x80; regs[0x11] &= ~0x80;
+    for (uint8_t i = 0; i < 25; i++) { outb(0x3D4, i); outb(0x3D5, *regs++); }
+    for (uint8_t i = 0; i < 9; i++) { outb(0x3CE, i); outb(0x3CF, *regs++); }
+    for (uint8_t i = 0; i < 21; i++) { inb(0x3DA); outb(0x3C0, i); outb(0x3C0, *regs++); }
+    inb(0x3DA); outb(0x3C0, 0x20);
 }
 
-void print_char(char c, uint8_t color = 0x0F) {
-    if (c == '\n') {
-        vga_index += 80 - (vga_index % 80);
-        return;
-    }
-    if (c == '\b') {
-        if (vga_index > 0) {
-            vga_index--;
-            vga_text[vga_index] = make_vgaentry(' ', color);
-        }
-        return;
-    }
-    vga_text[vga_index++] = make_vgaentry(c, color);
+void set_mode_13h() {
+    write_vga_regs(g_320x200x256);
+    in_gfx_mode = true;
 }
 
-void print_str(const char* str, uint8_t color = 0x0F) {
-    for (int i = 0; str[i] != '\0'; ++i) print_char(str[i], color);
+void set_mode_text() {
+    write_vga_regs(g_80x25_text);
+    in_gfx_mode = false;
 }
 
-void clear_screen() {
-    for (int i = 0; i < BUF_SIZE; i++) vga_text[i] = make_vgaentry(' ', 0x0F);
-    vga_index = 0;
+// --- DOUBLE BUFFERING & DRAWING PRIMITIVES ---
+void clear_back_buffer(uint8_t color) {
+    for (int i = 0; i < GFX_SIZE; i++) back_buffer[i] = color;
 }
 
-// --- MODE 13H GRAPHICS PRIMITIVES ---
+void swap_buffers() {
+    for (int i = 0; i < GFX_SIZE; i++) vga_gfx[i] = back_buffer[i];
+}
+
 void draw_pixel(int x, int y, uint8_t color) {
     if (x >= 0 && x < 320 && y >= 0 && y < 200) {
-        vga_gfx[y * 320 + x] = color;
+        back_buffer[y * 320 + x] = color;
     }
 }
 
@@ -119,11 +141,57 @@ void draw_rect(int x, int y, int w, int h, uint8_t color) {
     }
 }
 
-void demo_graphics() {
-    for (int i = 0; i < 320 * 200; i++) vga_gfx[i] = 0x00;
-    draw_rect(20, 20, 100, 60, 0x0A);
-    draw_rect(140, 50, 80, 80, 0x0C);
-    draw_rect(80, 110, 150, 40, 0x01);
+void draw_line(int x0, int y0, int x1, int y1, uint8_t color) {
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int dy = (y1 > y0) ? -(y1 - y0) : (y0 - y1);
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+
+    while (1) {
+        draw_pixel(x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+void draw_circle(int xc, int yc, int r, uint8_t color) {
+    int x = 0, y = r;
+    int d = 3 - 2 * r;
+    while (y >= x) {
+        draw_pixel(xc + x, yc + y, color); draw_pixel(xc - x, yc + y, color);
+        draw_pixel(xc + x, yc - y, color); draw_pixel(xc - x, yc - y, color);
+        draw_pixel(xc + y, yc + x, color); draw_pixel(xc - y, yc + x, color);
+        draw_pixel(xc + y, yc - x, color); draw_pixel(xc - y, yc - x, color);
+        x++;
+        if (d > 0) { y--; d = d + 4 * (x - y) + 10; }
+        else { d = d + 4 * x + 6; }
+    }
+}
+
+// --- WINDOWING & GUI ENGINE ---
+struct Window {
+    int x, y, w, h;
+    uint8_t color;
+    bool active;
+};
+
+Window main_win = { 40, 30, 160, 100, 0x01, true };
+bool is_dragging = false;
+int drag_off_x = 0, drag_off_y = 0;
+
+void render_desktop_gui() {
+    clear_back_buffer(0x03); // Desktop background color
+
+    if (main_win.active) {
+        draw_rect(main_win.x, main_win.y, main_win.w, 12, 0x01); // Title bar
+        draw_rect(main_win.x, main_win.y + 12, main_win.w, main_win.h - 12, 0x1F); // Window body
+    }
+
+    draw_rect(0, 185, 320, 15, 0x08); // Taskbar
+    draw_rect(2, 187, 40, 11, 0x02); // Start button
 }
 
 // --- PS/2 MOUSE DRIVER ---
@@ -154,21 +222,14 @@ uint8_t mouse_read() {
 }
 
 void mouse_init() {
-    mouse_wait(1);
-    outb(0x64, 0xA8);
-    mouse_wait(1);
-    outb(0x64, 0x20);
-    mouse_wait(0);
-    uint8_t status = inb(0x60) | 2;
-    mouse_wait(1);
-    outb(0x64, 0x60);
-    mouse_wait(1);
-    outb(0x60, status);
+    mouse_wait(1); outb(0x64, 0xA8);
+    mouse_wait(1); outb(0x64, 0x20);
+    mouse_wait(0); uint8_t status = inb(0x60) | 2;
+    mouse_wait(1); outb(0x64, 0x60);
+    mouse_wait(1); outb(0x60, status);
     
-    mouse_write(0xF6);
-    mouse_read();
-    mouse_write(0xF4);
-    mouse_read();
+    mouse_write(0xF6); mouse_read();
+    mouse_write(0xF4); mouse_read();
 }
 
 void draw_mouse_cursor(int x, int y, uint8_t color) {
@@ -194,10 +255,73 @@ void poll_mouse() {
             if (mouse_y < 0) mouse_y = 0;
             if (mouse_y > 195) mouse_y = 195;
 
-            // Render cursor directly on mouse packet update
-            draw_mouse_cursor(mouse_x, mouse_y, (mouse_byte[0] & 1) ? 0x0C : 0x0F);
+            bool left_click = (mouse_byte[0] & 1) != 0;
+
+            if (left_click) {
+                if (!is_dragging) {
+                    if (mouse_x >= main_win.x && mouse_x <= (main_win.x + main_win.w) &&
+                        mouse_y >= main_win.y && mouse_y <= (main_win.y + 12)) {
+                        is_dragging = true;
+                        drag_off_x = mouse_x - main_win.x;
+                        drag_off_y = mouse_y - main_win.y;
+                    }
+                } else {
+                    main_win.x = mouse_x - drag_off_x;
+                    main_win.y = mouse_y - drag_off_y;
+                }
+            } else {
+                is_dragging = false;
+            }
+
+            if (in_gfx_mode) {
+                render_desktop_gui();
+                draw_mouse_cursor(mouse_x, mouse_y, left_click ? 0x0C : 0x0F);
+                swap_buffers();
+            }
         }
     }
+}
+
+// --- TEXT TERMINAL DRIVER ---
+uint16_t make_vgaentry(char c, uint8_t color) {
+    return (uint16_t) c | (uint16_t) color << 8;
+}
+
+void print_char(char c, uint8_t color = 0x0F) {
+    if (c == '\n') {
+        vga_index += 80 - (vga_index % 80);
+        return;
+    }
+    if (c == '\b') {
+        if (vga_index > 0) {
+            vga_index--;
+            vga_text[vga_index] = make_vgaentry(' ', color);
+        }
+        return;
+    }
+    vga_text[vga_index++] = make_vgaentry(c, color);
+}
+
+void print_str(const char* str, uint8_t color = 0x0F) {
+    for (int i = 0; str[i] != '\0'; ++i) print_char(str[i], color);
+}
+
+void clear_screen() {
+    for (int i = 0; i < BUF_SIZE; i++) vga_text[i] = make_vgaentry(' ', 0x0F);
+    vga_index = 0;
+}
+
+// --- TEXT-BASED TERMINAL GUI RENDERER ---
+void launch_gui() {
+    clear_screen();
+    print_str("+-------------------------------------------------------------------------+\n", 0x0B);
+    print_str("|                           FLUX OS DESKTOP GUI                           |\n", 0x0B);
+    print_str("+-------------------------------------------------------------------------+\n", 0x0B);
+    print_str("|  [1] View Memory Status                                                 |\n", 0x0F);
+    print_str("|  [2] List RAM VFS Files                                                 |\n", 0x0F);
+    print_str("|  [3] System Information                                                 |\n", 0x0F);
+    print_str("|  [4] Return to Shell                                                    |\n", 0x0F);
+    print_str("+-------------------------------------------------------------------------+\n", 0x0B);
 }
 
 // --- RAM VFS ---
@@ -216,7 +340,7 @@ void vfs_init() {
     for (int i = 0; default_name[i]; i++) vfs_table[0].name[i] = default_name[i];
     vfs_table[0].name[9] = '\0';
     
-    const char* default_code = "a=100\nif a > 50 print 999\nrect 10 10 50 50 12\n";
+    const char* default_code = "a=1\nwhile a < 5 print a\na = a + 1\n";
     for (int i = 0; default_code[i]; i++) vfs_table[0].content[i] = default_code[i];
 }
 
@@ -379,7 +503,7 @@ void eval_flux(const char* code) {
 
     if (code[0] == '\0') return;
 
-    // Control Flow: IF <var/val> <op> <var/val> <cmd>
+    // Control Flow: IF
     if (strncmp(code, "if ", 3) == 0) {
         const char* p = code + 3;
         char left[32], right[32], op[3];
@@ -403,24 +527,83 @@ void eval_flux(const char* code) {
         else if (strcmp(op, "<") == 0) condition = l_val < r_val;
         else if (strcmp(op, "==") == 0) condition = l_val == r_val;
 
-        if (condition) {
+        if (condition) eval_flux(p);
+        return;
+    }
+
+    // Control Flow: WHILE
+    if (strncmp(code, "while ", 6) == 0) {
+        const char* p = code + 6;
+        char left[32], right[32], op[3];
+        int idx = 0;
+        while (*p && *p != ' ' && idx < 31) left[idx++] = *p++; left[idx] = '\0';
+        if (*p == ' ') p++;
+
+        idx = 0;
+        while (*p && *p != ' ' && idx < 2) op[idx++] = *p++; op[idx] = '\0';
+        if (*p == ' ') p++;
+
+        idx = 0;
+        while (*p && *p != ' ' && idx < 31) right[idx++] = *p++; right[idx] = '\0';
+        if (*p == ' ') p++;
+
+        int loop_guard = 0;
+        while (loop_guard < 100) {
+            int l_val = is_digit(left[0]) ? atoi(left) : get_var(left);
+            int r_val = is_digit(right[0]) ? atoi(right) : get_var(right);
+
+            bool condition = false;
+            if (strcmp(op, ">") == 0) condition = l_val > r_val;
+            else if (strcmp(op, "<") == 0) condition = l_val < r_val;
+            else if (strcmp(op, "==") == 0) condition = l_val == r_val;
+
+            if (!condition) break;
+
             eval_flux(p);
+            loop_guard++;
         }
         return;
     }
 
-    // Graphics Draw Command: rect x y w h color
+    // Graphics Draw Commands
+    if (strncmp(code, "cls ", 4) == 0) {
+        clear_back_buffer((uint8_t)atoi(code + 4));
+        if (in_gfx_mode) swap_buffers();
+        return;
+    }
     if (strncmp(code, "rect ", 5) == 0) {
-        int x = 0, y = 0, w = 0, h = 0, color = 15;
+        int x = 0, y = 0, w = 0, h = 0, c = 15;
         const char* p = code + 5;
         x = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
         y = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
         w = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
         h = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
-        color = atoi(p);
-        
-        draw_rect(x, y, w, h, (uint8_t)color);
-        print_str(">> [rect rendered]\n", 0x0A);
+        c = atoi(p);
+        draw_rect(x, y, w, h, (uint8_t)c);
+        if (in_gfx_mode) swap_buffers();
+        return;
+    }
+    if (strncmp(code, "line ", 5) == 0) {
+        int x0 = 0, y0 = 0, x1 = 0, y1 = 0, c = 15;
+        const char* p = code + 5;
+        x0 = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        y0 = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        x1 = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        y1 = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        c = atoi(p);
+        draw_line(x0, y0, x1, y1, (uint8_t)c);
+        if (in_gfx_mode) swap_buffers();
+        return;
+    }
+    if (strncmp(code, "circle ", 7) == 0) {
+        int x = 0, y = 0, r = 0, c = 15;
+        const char* p = code + 7;
+        x = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        y = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        r = atoi(p); while (*p && *p != ' ') p++; while (*p == ' ') p++;
+        c = atoi(p);
+        draw_circle(x, y, r, (uint8_t)c);
+        if (in_gfx_mode) swap_buffers();
         return;
     }
 
@@ -441,30 +624,36 @@ void eval_flux(const char* code) {
         int val = eval_expr(eq_ptr + 1);
         set_var(var_name, val);
 
-        print_str(">> set ", 0x0A);
-        print_str(var_name, 0x0F);
-        print_str(" = ", 0x0A);
-        char num_buf[16];
-        itoa(val, num_buf);
-        print_str(num_buf, 0x0F);
-        print_char('\n');
+        if (!in_gfx_mode) {
+            print_str(">> set ", 0x0A);
+            print_str(var_name, 0x0F);
+            print_str(" = ", 0x0A);
+            char num_buf[16];
+            itoa(val, num_buf);
+            print_str(num_buf, 0x0F);
+            print_char('\n');
+        }
         return;
     }
 
     // Print
     if (strncmp(code, "print ", 6) == 0) {
         int res = eval_expr(code + 6);
-        print_str(">> ", 0x0A);
-        char num_buf[16];
-        itoa(res, num_buf);
-        print_str(num_buf, 0x0F);
-        print_char('\n');
+        if (!in_gfx_mode) {
+            print_str(">> ", 0x0A);
+            char num_buf[16];
+            itoa(res, num_buf);
+            print_str(num_buf, 0x0F);
+            print_char('\n');
+        }
         return;
     }
 
-    print_str(">> ", 0x0A);
-    print_str(code, 0x0F);
-    print_char('\n');
+    if (!in_gfx_mode) {
+        print_str(">> ", 0x0A);
+        print_str(code, 0x0F);
+        print_char('\n');
+    }
 }
 
 void exec_vfs_file(const char* filename) {
@@ -476,9 +665,11 @@ void exec_vfs_file(const char* filename) {
         return;
     }
 
-    print_str("--- Executing ", 0x0B);
-    print_str(filename, 0x0B);
-    print_str(" ---\n", 0x0B);
+    if (!in_gfx_mode) {
+        print_str("--- Executing ", 0x0B);
+        print_str(filename, 0x0B);
+        print_str(" ---\n", 0x0B);
+    }
 
     char line_buf[256];
     int idx = 0;
@@ -498,7 +689,9 @@ void exec_vfs_file(const char* filename) {
         line_buf[idx] = '\0';
         eval_flux(line_buf);
     }
-    print_str("------------------------------\n", 0x0B);
+    if (!in_gfx_mode) {
+        print_str("------------------------------\n", 0x0B);
+    }
 }
 
 // Interactive Text Editor
@@ -538,6 +731,7 @@ void execute_command(char* cmd) {
     if (strcmp(cmd, "help") == 0) {
         print_str("Available OS Commands:\n", 0x0B);
         print_str("  flux              - Launch Flux REPL\n", 0x0F);
+        print_str("  gui               - Launch Text OS Desktop GUI\n", 0x0F);
         print_str("  ls                - List files in RAM VFS\n", 0x0F);
         print_str("  cat <f>           - Display file contents\n", 0x0F);
         print_str("  touch <f>         - Create a new script file\n", 0x0F);
@@ -545,9 +739,12 @@ void execute_command(char* cmd) {
         print_str("  add <f> <line>    - Append line to script\n", 0x0F);
         print_str("  rm <f>            - Delete file\n", 0x0F);
         print_str("  exec <f>          - Execute Flux script\n", 0x0F);
-        print_str("  gfx               - VGA graphics demo\n", 0x0F);
+        print_str("  vga               - Switch to Mode 13h Hardware Graphics\n", 0x0F);
+        print_str("  text              - Switch back to Text Mode\n", 0x0F);
         print_str("  clear             - Clear terminal screen\n", 0x0F);
         print_str("  mem               - Check memory status\n", 0x0F);
+    } else if (strcmp(cmd, "gui") == 0) {
+        launch_gui();
     } else if (strcmp(cmd, "flux") == 0) {
         in_flux_repl = true;
         print_str("=== Flux OS Bare-Metal REPL ===\n", 0x0B);
@@ -578,12 +775,18 @@ void execute_command(char* cmd) {
         vfs_append(fname, p);
     } else if (strncmp(cmd, "exec ", 5) == 0) {
         exec_vfs_file(cmd + 5);
-    } else if (strcmp(cmd, "gfx") == 0) {
-        demo_graphics();
+    } else if (strcmp(cmd, "vga") == 0) {
+        set_mode_13h();
+        render_desktop_gui();
+        swap_buffers();
+    } else if (strcmp(cmd, "text") == 0) {
+        set_mode_text();
+        clear_screen();
+        print_str("Returned to Text Mode.\n", 0x0A);
     } else if (strcmp(cmd, "clear") == 0) {
         clear_screen();
     } else if (strcmp(cmd, "mem") == 0) {
-        print_str("Heap Base: 0x200000 | Dynamic kmalloc Ready\n", 0x0A);
+        print_str("Heap Base: 0x200000 | Back Buffer: 0x100000\n", 0x0A);
     } else if (cmd[0] != '\0') {
         print_str("Unknown command: ", 0x0C);
         print_str(cmd, 0x0C);
@@ -660,7 +863,7 @@ extern "C" void kernel_main() {
     mouse_init();
 
     print_str("===================================\n", 0x0B);
-    print_str("       FLUX BARE-METAL OS v0.9     \n", 0x0A);
+    print_str("       FLUX BARE-METAL OS v1.0     \n", 0x0A);
     print_str("===================================\n\n", 0x0B);
     print_str("Type 'help' to view system commands.\n\n", 0x0F);
     print_str("flux_os> ", 0x0E);
@@ -677,26 +880,33 @@ extern "C" void kernel_main() {
             if (scancode != last_scancode) {
                 char ch = get_char_from_scancode(scancode);
                 if (!(scancode & 0x80)) {
-                    if (ch == '\n') {
-                        print_char('\n');
+                    // Pressing ESC toggles back to text mode from GUI
+                    if (scancode == 0x01 && in_gfx_mode) {
+                        set_mode_text();
+                        clear_screen();
+                        print_str("flux_os> ", 0x0E);
+                    } else if (ch == '\n') {
+                        if (!in_gfx_mode) print_char('\n');
                         cmd_buf[buf_idx] = '\0';
                         execute_command(cmd_buf);
                         buf_idx = 0;
-                        if (in_editor) {
-                            print_str("edit> ", 0x0E);
-                        } else if (in_flux_repl) {
-                            print_str("flux> ", 0x0B);
-                        } else {
-                            print_str("flux_os> ", 0x0E);
+                        if (!in_gfx_mode) {
+                            if (in_editor) {
+                                print_str("edit> ", 0x0E);
+                            } else if (in_flux_repl) {
+                                print_str("flux> ", 0x0B);
+                            } else {
+                                print_str("flux_os> ", 0x0E);
+                            }
                         }
                     } else if (ch == '\b') {
                         if (buf_idx > 0) {
                             buf_idx--;
-                            print_char('\b');
+                            if (!in_gfx_mode) print_char('\b');
                         }
                     } else if (ch != 0 && buf_idx < MAX_CMD_LEN - 1) {
                         cmd_buf[buf_idx++] = ch;
-                        print_char(ch, 0x0F);
+                        if (!in_gfx_mode) print_char(ch, 0x0F);
                     }
                 }
             }
